@@ -1,8 +1,146 @@
 #include "ftl.h"
+#include <time.h>
+// #define FEMU_DEBUG_FTL
+#define BUFFER_SIZE 30
+#define HOT_THRESHOLD 10
 
-//#define FEMU_DEBUG_FTL
+uint64_t *write_lpn_access_cnt;
+uint64_t io_cnt = 0;
+uint64_t host_written_pages = 0; 
+uint64_t gc_written_pages = 0; 
+
+static stats stats_buffer[BUFFER_SIZE];
+static size_t stats_index = 0;
+static timer_t timerid;
+uint64_t max_lpn = 0;
 
 static void *ftl_thread(void *arg);
+void init_timer(void);
+void timer_handler(union sigval sv);
+void print_write_lpn_access_cnt(void);
+void print_statistics(void);
+static inline bool get_data_type(uint64_t lpn);
+
+void init_timer(void) {
+    struct sigevent sev;
+    struct itimerspec its;
+
+    // Set up the timer to trigger a handler
+    sev.sigev_notify = SIGEV_THREAD; // Notify via thread execution
+    sev.sigev_value.sival_ptr = NULL;
+    sev.sigev_notify_function = timer_handler; // Timer expiration handler
+    sev.sigev_notify_attributes = NULL;
+    
+    // Create the timer with the specified settings
+    // The timer starts in a state where it trigger the handler every 1 second
+    if (timer_create(CLOCK_MONOTONIC, &sev, &timerid) == -1) {
+        perror("timer_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // Set the timer's initial expriration and interval for FIO detection
+    its.it_value.tv_sec = 1; // Initial expriation in 1 second
+    its.it_value.tv_nsec = 0;
+    its.it_interval.tv_sec = 1; // Trigger every 1 second until updated
+    its.it_interval.tv_nsec = 0;
+
+    // Start the timer with the specified settings
+    if (timer_settime(timerid, TIMER_ABSTIME, &its, NULL) == -1) {
+        perror("timer_settime failed");
+        exit(EXIT_FAILURE);
+    }
+    // The timer will call timer_handler every second unitl FIO is detected.
+    // Once FIO is deteceted, the interval change to 10 second.
+}
+
+void timer_handler(union sigval sv) {
+    static bool fio_detected = false; // Tracks if FIO workload is detected
+    static time_t start_time = 0; // Start time of the FIO workload
+    static int interval_count = 0; // Number of 10-second intervals processed
+
+    // Detect FIO workload when I/O count exceeds 1000 in 1 second (initial timer interval)
+    if (!fio_detected && io_cnt > 1000) {
+        fio_detected = true;
+        printf("FIO detected. Switching to 10-second interval logging.\n");
+        
+        // Modify the timer's expiration and interval
+        struct itimerspec its;
+        its.it_value.tv_sec = 10; // Set next expiration to 10 seconds
+        its.it_value.tv_nsec = 0;
+        its.it_interval.tv_sec = 10; // Update interval to 10 seconds
+        its.it_interval.tv_nsec = 0;
+
+        if (timer_settime(timerid, 0, &its, NULL) == -1) {
+            perror("timer_settime failed");
+            exit(EXIT_FAILURE);
+        }
+        start_time = time(NULL); // Record start time for logging
+        return;
+    }
+
+    // If FIO workload is detected, log statistics every 10 seconds
+    if (fio_detected) {
+        ++interval_count; // Increment the number of 10-second intervals processed
+
+        // Record statistics in the buffer
+        stats_buffer[stats_index].seconds = difftime(time(NULL), start_time); // Elapsed time since detecting FIO
+        stats_buffer[stats_index].iops = io_cnt / 10; // Average I/O operations per second over 10 seconds
+        stats_buffer[stats_index++].waf = (double)(host_written_pages + gc_written_pages) / host_written_pages; // Write amplification factor over 10 seconds
+        
+        // Reset counters for the next interval
+        io_cnt = 0;
+        host_written_pages = 0;
+        gc_written_pages = 0;
+
+        // Stop logging after 30 intervals (300 seconds)
+        if (interval_count >= 30) {
+            printf("FIO finished.\n");
+            // print_write_lpn_access_cnt();
+            print_statistics(); // Log the recorded statistics
+            timer_delete(timerid); // Delete the timer to stop further logging
+        }
+    }
+}
+
+
+void print_statistics(void) {
+    // Open a file to log statistics(second, iops, waf)
+    FILE *log_file = fopen("statistics.csv", "a"); 
+    fprintf(log_file, "seconds,iops,waf\n");
+    // Log the elapsed time, iops, waf in 10 second
+    for (size_t i = 0; i < stats_index; i++) {
+        fprintf(log_file, "%.0f,%ld,%.2f\n",
+                stats_buffer[i].seconds,
+                stats_buffer[i].iops,
+                stats_buffer[i].waf);
+    }
+    fflush(log_file);
+    fclose(log_file);
+}
+
+void print_write_lpn_access_cnt(void) {
+    // Open a file to log lpn access count
+    FILE *file = fopen("lpn_access_count.csv", "w"); 
+    if (file == NULL) {
+        perror("file open error");
+        return;
+    }
+    // Write the header row
+    fprintf(file, "LPN,Access_Count\n");
+    // Log the lpn access count
+    for (uint64_t lpn = 0; lpn < max_lpn; lpn++) {
+        fprintf(file, "%lu,%lu\n", lpn, write_lpn_access_cnt[lpn]);
+    }
+    fflush(file);
+    fclose(file);
+}
+
+// Determine the type of data (hot or cold) based on LPN access count
+static inline bool get_data_type(uint64_t lpn) {
+    // If the write access count for the given LPN exceeds the hot threshold,
+    // classify the data as "hot" (return true). Otherwise, classify it as "cold" (return false).
+    return write_lpn_access_cnt[lpn] > HOT_THRESHOLD;
+}
 
 static inline bool should_gc(struct ssd *ssd)
 {
@@ -30,10 +168,10 @@ static uint64_t ppa2pgidx(struct ssd *ssd, struct ppa *ppa)
     struct ssdparams *spp = &ssd->sp;
     uint64_t pgidx;
 
-    pgidx = ppa->g.ch  * spp->pgs_per_ch  + \
-            ppa->g.lun * spp->pgs_per_lun + \
-            ppa->g.pl  * spp->pgs_per_pl  + \
-            ppa->g.blk * spp->pgs_per_blk + \
+    pgidx = ppa->g.ch * spp->pgs_per_ch +
+            ppa->g.lun * spp->pgs_per_lun +
+            ppa->g.pl * spp->pgs_per_pl +
+            ppa->g.blk * spp->pgs_per_blk +
             ppa->g.pg;
 
     ftl_assert(pgidx < spp->tt_pgs);
@@ -93,12 +231,12 @@ static void ssd_init_lines(struct ssd *ssd)
 
     QTAILQ_INIT(&lm->free_line_list);
     lm->victim_line_pq = pqueue_init(spp->tt_lines, victim_line_cmp_pri,
-            victim_line_get_pri, victim_line_set_pri,
-            victim_line_get_pos, victim_line_set_pos);
+                                     victim_line_get_pri, victim_line_set_pri,
+                                     victim_line_get_pos, victim_line_set_pos);
     QTAILQ_INIT(&lm->full_line_list);
 
     lm->free_line_cnt = 0;
-    for (int i = 0; i < lm->tt_lines; i++) {
+    for (int i = 0; i < lm->tt_lines; i++){
         line = &lm->lines[i];
         line->id = i;
         line->ipc = 0;
@@ -116,21 +254,38 @@ static void ssd_init_lines(struct ssd *ssd)
 
 static void ssd_init_write_pointer(struct ssd *ssd)
 {
-    struct write_pointer *wpp = &ssd->wp;
+    // initialize hot pointer
+    struct write_pointer *hp = &ssd->hp;
     struct line_mgmt *lm = &ssd->lm;
     struct line *curline = NULL;
 
     curline = QTAILQ_FIRST(&lm->free_line_list);
     QTAILQ_REMOVE(&lm->free_line_list, curline, entry);
     lm->free_line_cnt--;
-
     /* wpp->curline is always our next-to-write super-block */
-    wpp->curline = curline;
-    wpp->ch = 0;
-    wpp->lun = 0;
-    wpp->pg = 0;
-    wpp->blk = 0;
-    wpp->pl = 0;
+
+    hp->curline = curline;
+    hp->ch = 0;
+    hp->lun = 0;
+    hp->pg = 0;
+    // 'Line' groups blocks with the same number across chips.
+    hp->blk = curline->id; 
+    hp->pl = 0;
+    
+    // initalize cold pointer
+    struct write_pointer *cp = &ssd->cp;
+    curline = QTAILQ_FIRST(&lm->free_line_list);
+    QTAILQ_REMOVE(&lm->free_line_list, curline, entry);
+    lm->free_line_cnt--;
+    /* wpp->curline is always our next-to-write super-block */
+
+    cp->curline = curline;
+    cp->ch = 0;
+    cp->lun = 0;
+    cp->pg = 0;
+    // same logic applies for cold pointer
+    cp->blk = curline->id;
+    cp->pl = 0;
 }
 
 static inline void check_addr(int a, int max)
@@ -144,7 +299,7 @@ static struct line *get_next_free_line(struct ssd *ssd)
     struct line *curline = NULL;
 
     curline = QTAILQ_FIRST(&lm->free_line_list);
-    if (!curline) {
+    if (!curline){
         ftl_err("No free lines left in [%s] !!!!\n", ssd->ssdname);
         return NULL;
     }
@@ -154,49 +309,54 @@ static struct line *get_next_free_line(struct ssd *ssd)
     return curline;
 }
 
-static void ssd_advance_write_pointer(struct ssd *ssd)
+static void ssd_advance_write_pointer(struct ssd *ssd, bool type)
 {
     struct ssdparams *spp = &ssd->sp;
-    struct write_pointer *wpp = &ssd->wp;
+    // Determine which write pointer to use based on the type
+    // If 'type' is true, use the hot write pointer (hp)
+    // If 'type' is false, use the cold write pointer (cp)
+    struct write_pointer *wpp = type ? &ssd->hp : &ssd->cp;
     struct line_mgmt *lm = &ssd->lm;
 
-    check_addr(wpp->ch, spp->nchs);
-    wpp->ch++;
+    check_addr(wpp->ch, spp->nchs); 
+    wpp->ch++;                     
     if (wpp->ch == spp->nchs) {
-        wpp->ch = 0;
+        wpp->ch = 0;                            
         check_addr(wpp->lun, spp->luns_per_ch);
-        wpp->lun++;
+        wpp->lun++;                             
         /* in this case, we should go to next lun */
         if (wpp->lun == spp->luns_per_ch) {
-            wpp->lun = 0;
+            wpp->lun = 0; 
             /* go to next page in the block */
-            check_addr(wpp->pg, spp->pgs_per_blk);
-            wpp->pg++;
+            check_addr(wpp->pg, spp->pgs_per_blk); 
+            wpp->pg++;                             
             if (wpp->pg == spp->pgs_per_blk) {
-                wpp->pg = 0;
+                wpp->pg = 0; 
                 /* move current line to {victim,full} line list */
                 if (wpp->curline->vpc == spp->pgs_per_line) {
                     /* all pgs are still valid, move to full line list */
                     ftl_assert(wpp->curline->ipc == 0);
                     QTAILQ_INSERT_TAIL(&lm->full_line_list, wpp->curline, entry);
-                    lm->full_line_cnt++;
-                } else {
+                    lm->full_line_cnt++;                                         
+                }
+                else {
                     ftl_assert(wpp->curline->vpc >= 0 && wpp->curline->vpc < spp->pgs_per_line);
                     /* there must be some invalid pages in this line */
                     ftl_assert(wpp->curline->ipc > 0);
-                    pqueue_insert(lm->victim_line_pq, wpp->curline);
-                    lm->victim_line_cnt++;
+                    pqueue_insert(lm->victim_line_pq, wpp->curline); 
+                    lm->victim_line_cnt++;                          
                 }
                 /* current line is used up, pick another empty line */
-                check_addr(wpp->blk, spp->blks_per_pl);
+                check_addr(wpp->blk, spp->blks_per_pl); 
                 wpp->curline = NULL;
-                wpp->curline = get_next_free_line(ssd);
+                wpp->curline = get_next_free_line(ssd); 
+
                 if (!wpp->curline) {
                     /* TODO */
                     abort();
                 }
-                wpp->blk = wpp->curline->id;
-                check_addr(wpp->blk, spp->blks_per_pl);
+                wpp->blk = wpp->curline->id;            
+                check_addr(wpp->blk, spp->blks_per_pl); 
                 /* make sure we are starting from page 0 in the super block */
                 ftl_assert(wpp->pg == 0);
                 ftl_assert(wpp->lun == 0);
@@ -208,9 +368,13 @@ static void ssd_advance_write_pointer(struct ssd *ssd)
     }
 }
 
-static struct ppa get_new_page(struct ssd *ssd)
+static struct ppa get_new_page(struct ssd *ssd, bool type)
 {
-    struct write_pointer *wpp = &ssd->wp;
+    // Determine which write pointer to use based on the type
+    // If 'type' is true, use the hot write pointer (hp)
+    // If 'type' is false, use the cold write pointer (cp)
+    struct write_pointer *wpp = type ? &ssd->hp : &ssd->cp;
+
     struct ppa ppa;
     ppa.ppa = 0;
     ppa.g.ch = wpp->ch;
@@ -223,6 +387,7 @@ static struct ppa get_new_page(struct ssd *ssd)
     return ppa;
 }
 
+
 static void check_params(struct ssdparams *spp)
 {
     /*
@@ -230,19 +395,19 @@ static void check_params(struct ssdparams *spp)
      * force luns_per_ch and nchs to be power of 2
      */
 
-    //ftl_assert(is_power_of_2(spp->luns_per_ch));
-    //ftl_assert(is_power_of_2(spp->nchs));
+    // ftl_assert(is_power_of_2(spp->luns_per_ch));
+    // ftl_assert(is_power_of_2(spp->nchs));
 }
 
 static void ssd_init_params(struct ssdparams *spp, FemuCtrl *n)
 {
-    spp->secsz = n->bb_params.secsz; // 512
+    spp->secsz = n->bb_params.secsz;             // 512
     spp->secs_per_pg = n->bb_params.secs_per_pg; // 8
-    spp->pgs_per_blk = n->bb_params.pgs_per_blk; //256
+    spp->pgs_per_blk = n->bb_params.pgs_per_blk; // 256
     spp->blks_per_pl = n->bb_params.blks_per_pl; /* 256 16GB */
     spp->pls_per_lun = n->bb_params.pls_per_lun; // 1
     spp->luns_per_ch = n->bb_params.luns_per_ch; // 8
-    spp->nchs = n->bb_params.nchs; // 8
+    spp->nchs = n->bb_params.nchs;               // 8
 
     spp->pg_rd_lat = n->bb_params.pg_rd_lat;
     spp->pg_wr_lat = n->bb_params.pg_wr_lat;
@@ -265,7 +430,7 @@ static void ssd_init_params(struct ssdparams *spp, FemuCtrl *n)
     spp->blks_per_ch = spp->blks_per_lun * spp->luns_per_ch;
     spp->tt_blks = spp->blks_per_ch * spp->nchs;
 
-    spp->pls_per_ch =  spp->pls_per_lun * spp->luns_per_ch;
+    spp->pls_per_ch = spp->pls_per_lun * spp->luns_per_ch;
     spp->tt_pls = spp->pls_per_ch * spp->nchs;
 
     spp->tt_luns = spp->luns_per_ch * spp->nchs;
@@ -276,12 +441,11 @@ static void ssd_init_params(struct ssdparams *spp, FemuCtrl *n)
     spp->secs_per_line = spp->pgs_per_line * spp->secs_per_pg;
     spp->tt_lines = spp->blks_per_lun; /* TODO: to fix under multiplanes */
 
-    spp->gc_thres_pcent = n->bb_params.gc_thres_pcent/100.0;
+    spp->gc_thres_pcent = n->bb_params.gc_thres_pcent / 100.0;
     spp->gc_thres_lines = (int)((1 - spp->gc_thres_pcent) * spp->tt_lines);
-    spp->gc_thres_pcent_high = n->bb_params.gc_thres_pcent_high/100.0;
+    spp->gc_thres_pcent_high = n->bb_params.gc_thres_pcent_high / 100.0;
     spp->gc_thres_lines_high = (int)((1 - spp->gc_thres_pcent_high) * spp->tt_lines);
     spp->enable_gc_delay = true;
-
 
     check_params(spp);
 }
@@ -375,6 +539,9 @@ void ssd_init(FemuCtrl *n)
         ssd_init_ch(&ssd->ch[i], spp);
     }
 
+    // Allocate memory for write LPN access count array
+    write_lpn_access_cnt = g_malloc0(sizeof(uint64_t) * spp->tt_pgs);
+
     /* initialize maptbl */
     ssd_init_maptbl(ssd);
 
@@ -385,10 +552,13 @@ void ssd_init(FemuCtrl *n)
     ssd_init_lines(ssd);
 
     /* initialize write pointer, this is how we allocate new pages for writes */
-    ssd_init_write_pointer(ssd);
+    ssd_init_write_pointer(ssd); 
+    
+    // initialize statistic buffer
+    memset(stats_buffer, 0, sizeof(stats_buffer));
 
     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
-                       QEMU_THREAD_JOINABLE);
+                       QEMU_THREAD_JOINABLE); 
 }
 
 static inline bool valid_ppa(struct ssd *ssd, struct ppa *ppa)
@@ -401,9 +571,7 @@ static inline bool valid_ppa(struct ssd *ssd, struct ppa *ppa)
     int pg = ppa->g.pg;
     int sec = ppa->g.sec;
 
-    if (ch >= 0 && ch < spp->nchs && lun >= 0 && lun < spp->luns_per_ch && pl >=
-        0 && pl < spp->pls_per_lun && blk >= 0 && blk < spp->blks_per_pl && pg
-        >= 0 && pg < spp->pgs_per_blk && sec >= 0 && sec < spp->secs_per_pg)
+    if (ch >= 0 && ch < spp->nchs && lun >= 0 && lun < spp->luns_per_ch && pl >= 0 && pl < spp->pls_per_lun && blk >= 0 && blk < spp->blks_per_pl && pg >= 0 && pg < spp->pgs_per_blk && sec >= 0 && sec < spp->secs_per_pg)
         return true;
 
     return false;
@@ -524,7 +692,7 @@ static uint64_t ssd_advance_status(struct ssd *ssd, struct ppa *ppa, struct
     return lat;
 }
 
-/* update SSD status about one page from PG_VALID -> PG_INVALID */
+/* update SSD status about one page from PG_VALID -> PG_VALID */
 static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa)
 {
     struct line_mgmt *lm = &ssd->lm;
@@ -549,7 +717,7 @@ static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa)
     /* update corresponding line status */
     line = get_line(ssd, ppa);
     ftl_assert(line->ipc >= 0 && line->ipc < spp->pgs_per_line);
-    if (line->vpc == spp->pgs_per_line) {
+    if (line->vpc == spp->pgs_per_line){
         ftl_assert(line->ipc == 0);
         was_full_line = true;
     }
@@ -559,7 +727,8 @@ static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa)
     if (line->pos) {
         /* Note that line->vpc will be updated by this call */
         pqueue_change_priority(lm->victim_line_pq, line->vpc - 1, line);
-    } else {
+    }
+    else {
         line->vpc--;
     }
 
@@ -622,7 +791,7 @@ static void gc_read_page(struct ssd *ssd, struct ppa *ppa)
         gcr.type = GC_IO;
         gcr.cmd = NAND_READ;
         gcr.stime = 0;
-        ssd_advance_status(ssd, ppa, &gcr);
+        ssd_advance_status(ssd, ppa, &gcr); 
     }
 }
 
@@ -631,19 +800,25 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
 {
     struct ppa new_ppa;
     struct nand_lun *new_lun;
-    uint64_t lpn = get_rmap_ent(ssd, old_ppa);
+
+    uint64_t lpn = get_rmap_ent(ssd, old_ppa); 
 
     ftl_assert(valid_lpn(ssd, lpn));
-    new_ppa = get_new_page(ssd);
+    // Determine the data type (hot or cold) based on the write lpn access count
+
+    bool type = get_data_type(lpn); 
+    // Allocate a new page for the corresponding type (hot or cold)
+    new_ppa = get_new_page(ssd, type); 
+
     /* update maptbl */
-    set_maptbl_ent(ssd, lpn, &new_ppa);
+    set_maptbl_ent(ssd, lpn, &new_ppa); 
     /* update rmap */
-    set_rmap_ent(ssd, lpn, &new_ppa);
+    set_rmap_ent(ssd, lpn, &new_ppa); 
 
-    mark_page_valid(ssd, &new_ppa);
+    mark_page_valid(ssd, &new_ppa); 
 
-    /* need to advance the write pointer here */
-    ssd_advance_write_pointer(ssd);
+    // Advance the write pointer for the corresponding type (hot or cold)
+    ssd_advance_write_pointer(ssd, type); 
 
     if (ssd->sp.enable_gc_delay) {
         struct nand_cmd gcw;
@@ -659,8 +834,8 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
     new_ch->gc_endtime = new_ch->next_ch_avail_time;
 #endif
 
-    new_lun = get_lun(ssd, &new_ppa);
-    new_lun->gc_endtime = new_lun->next_lun_avail_time;
+    new_lun = get_lun(ssd, &new_ppa);                   
+    new_lun->gc_endtime = new_lun->next_lun_avail_time; 
 
     return 0;
 }
@@ -679,8 +854,8 @@ static struct line *select_victim_line(struct ssd *ssd, bool force)
         return NULL;
     }
 
-    pqueue_pop(lm->victim_line_pq);
-    victim_line->pos = 0;
+    pqueue_pop(lm->victim_line_pq); 
+    victim_line->pos = 0;           
     lm->victim_line_cnt--;
 
     /* victim_line is a danggling node now */
@@ -696,13 +871,14 @@ static void clean_one_block(struct ssd *ssd, struct ppa *ppa)
 
     for (int pg = 0; pg < spp->pgs_per_blk; pg++) {
         ppa->g.pg = pg;
-        pg_iter = get_pg(ssd, ppa);
+        pg_iter = get_pg(ssd, ppa); 
         /* there shouldn't be any free page in victim blocks */
-        ftl_assert(pg_iter->status != PG_FREE);
+        ftl_assert(pg_iter->status != PG_FREE);  
         if (pg_iter->status == PG_VALID) {
             gc_read_page(ssd, ppa);
             /* delay the maptbl update until "write" happens */
             gc_write_page(ssd, ppa);
+            gc_written_pages++; // increase gc written pages count
             cnt++;
         }
     }
@@ -734,18 +910,18 @@ static int do_gc(struct ssd *ssd, bool force)
         return -1;
     }
 
-    ppa.g.blk = victim_line->id;
+    ppa.g.blk = victim_line->id; 
     ftl_debug("GC-ing line:%d,ipc=%d,victim=%d,full=%d,free=%d\n", ppa.g.blk,
               victim_line->ipc, ssd->lm.victim_line_cnt, ssd->lm.full_line_cnt,
               ssd->lm.free_line_cnt);
-
+    
     /* copy back valid data */
     for (ch = 0; ch < spp->nchs; ch++) {
         for (lun = 0; lun < spp->luns_per_ch; lun++) {
             ppa.g.ch = ch;
             ppa.g.lun = lun;
             ppa.g.pl = 0;
-            lunp = get_lun(ssd, &ppa);
+            lunp = get_lun(ssd, &ppa); 
             clean_one_block(ssd, &ppa);
             mark_block_free(ssd, &ppa);
 
@@ -763,7 +939,6 @@ static int do_gc(struct ssd *ssd, bool force)
 
     /* update line status */
     mark_line_free(ssd, &ppa);
-
     return 0;
 }
 
@@ -779,16 +954,16 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
     uint64_t sublat, maxlat = 0;
 
     if (end_lpn >= spp->tt_pgs) {
-        ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
+        ftl_err("start_lpn=%" PRIu64 ",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
 
     /* normal IO read path */
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
         ppa = get_maptbl_ent(ssd, lpn);
         if (!mapped_ppa(&ppa) || !valid_ppa(ssd, &ppa)) {
-            //printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", ssd->ssdname, lpn);
-            //printf("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n",
-            //ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pl, ppa.g.pg, ppa.g.sec);
+            // printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", ssd->ssdname, lpn);
+            // printf("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n",
+            // ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pl, ppa.g.pg, ppa.g.sec);
             continue;
         }
 
@@ -799,7 +974,6 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         sublat = ssd_advance_status(ssd, &ppa, &srd);
         maxlat = (sublat > maxlat) ? sublat : maxlat;
     }
-
     return maxlat;
 }
 
@@ -816,11 +990,14 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     int r;
 
     if (end_lpn >= spp->tt_pgs) {
-        ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
+        ftl_err("start_lpn=%" PRIu64 ",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
 
+    // Update max_lpn for print lpn access count
+    if (end_lpn > max_lpn)
+        max_lpn = end_lpn;
+
     while (should_gc_high(ssd)) {
-        /* perform GC here until !should_gc(ssd) */
         r = do_gc(ssd, true);
         if (r == -1)
             break;
@@ -830,21 +1007,28 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         ppa = get_maptbl_ent(ssd, lpn);
         if (mapped_ppa(&ppa)) {
             /* update old page information first */
-            mark_page_invalid(ssd, &ppa);
+            mark_page_invalid(ssd, &ppa);         
             set_rmap_ent(ssd, INVALID_LPN, &ppa);
         }
 
-        /* new write */
-        ppa = get_new_page(ssd);
+        write_lpn_access_cnt[lpn]++; // increase host write lpn access count
+        host_written_pages++; // increase host write page count
+
+        // Determine the data type (hot or cold) based on the write lpn access count
+        bool type = get_data_type(lpn); 
+        // Allocate a new page for the corresponding type (hot or cold)
+        ppa = get_new_page(ssd, type); 
+
         /* update maptbl */
         set_maptbl_ent(ssd, lpn, &ppa);
+
         /* update rmap */
         set_rmap_ent(ssd, lpn, &ppa);
 
         mark_page_valid(ssd, &ppa);
 
-        /* need to advance the write pointer here */
-        ssd_advance_write_pointer(ssd);
+        // Advance the write pointer for the corresponding type (hot or cold)
+        ssd_advance_write_pointer(ssd, type); 
 
         struct nand_cmd swr;
         swr.type = USER_IO;
@@ -854,7 +1038,6 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         curlat = ssd_advance_status(ssd, &ppa, &swr);
         maxlat = (curlat > maxlat) ? curlat : maxlat;
     }
-
     return maxlat;
 }
 
@@ -875,9 +1058,12 @@ static void *ftl_thread(void *arg)
     ssd->to_ftl = n->to_ftl;
     ssd->to_poller = n->to_poller;
 
+    // Initialize the timer for detecting FIO and logging statistics
+    init_timer();
+
     while (1) {
         for (i = 1; i <= n->nr_pollers; i++) {
-            if (!ssd->to_ftl[i] || !femu_ring_count(ssd->to_ftl[i]))
+            if (!ssd->to_ftl[i] || !femu_ring_count(ssd->to_ftl[i])) 
                 continue;
 
             rc = femu_ring_dequeue(ssd->to_ftl[i], (void *)&req, 1);
@@ -889,15 +1075,17 @@ static void *ftl_thread(void *arg)
             switch (req->cmd.opcode) {
             case NVME_CMD_WRITE:
                 lat = ssd_write(ssd, req);
+                io_cnt++;
                 break;
             case NVME_CMD_READ:
                 lat = ssd_read(ssd, req);
+                io_cnt++;
                 break;
             case NVME_CMD_DSM:
                 lat = 0;
                 break;
             default:
-                //ftl_err("FTL received unkown request type, ERROR\n");
+                // ftl_err("FTL received unkown request type, ERROR\n");
                 ;
             }
 
@@ -915,6 +1103,5 @@ static void *ftl_thread(void *arg)
             }
         }
     }
-
     return NULL;
 }

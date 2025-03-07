@@ -2,7 +2,6 @@
 #define __FEMU_FTL_H
 
 #include "../nvme.h"
-
 #define INVALID_PPA     (~(0ULL))
 #define INVALID_LPN     (~(0ULL))
 #define UNMAPPED_PPA    (~(0ULL))
@@ -51,6 +50,13 @@ enum {
 #define PL_BITS     (8)
 #define LUN_BITS    (8)
 #define CH_BITS     (7)
+
+// Structure to hold performance statistics
+typedef struct {
+    double seconds;
+    uint64_t iops;
+    double waf;
+} stats;
 
 /* describe a physical page addr */
 struct ppa {
@@ -160,6 +166,7 @@ typedef struct line {
     int id;  /* line id, the same as corresponding block id */
     int ipc; /* invalid page count in this line */
     int vpc; /* valid page count in this line */
+    bool is_hot; // 라인의 핫/콜드 여부 (true: 핫라인, false: 콜드라인)
     QTAILQ_ENTRY(line) entry; /* in either {free,victim,full} list */
     /* position in the priority queue for victim lines */
     size_t                  pos;
@@ -200,7 +207,8 @@ struct ssd {
     struct ssd_channel *ch;
     struct ppa *maptbl; /* page level mapping table */
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
-    struct write_pointer wp;
+    struct write_pointer cp; // cold data write pointer
+    struct write_pointer hp; // hot data write pointer
     struct line_mgmt lm;
 
     /* lockless ring for communication with NVMe IO thread */
